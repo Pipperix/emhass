@@ -1,6 +1,6 @@
 [project]
 name = "emhass"
-version = "0.17.5"
+dynamic = ["version"]
 description = "An Energy Management System for Home Assistant"
 readme = "README.md"
 requires-python = ">=3.10, <3.13"
@@ -55,7 +55,12 @@ test = [
     "ruff",
     "tabulate",
     "hatchling",
-    "aioresponses"
+    "aioresponses",
+    # aioresponses 0.7.8 (latest) builds an aiohttp ClientResponse without the
+    # stream_writer argument that aiohttp>=3.13 made required, so the mock-based
+    # tests fail under aiohttp 3.13+. Cap aiohttp here (test extra only) until
+    # aioresponses ships 3.13 support; production installs stay unpinned.
+    "aiohttp<3.13",
 ]
 dev = ["ruff"]
 
@@ -73,6 +78,9 @@ emhass = { workspace = true }
 default-groups = "all"
 package = true
 override-dependencies = ["yarl<1.24"]
+
+[tool.hatch.version]
+path = "src/emhass/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/emhass"]
