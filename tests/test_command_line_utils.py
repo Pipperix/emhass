@@ -2320,6 +2320,45 @@ class TestOptimizationCache(unittest.TestCase):
         # Should still return cached object since operating hours are parameterized
         self.assertEqual(result, mock_opt)
 
+    def test_cache_hit_operating_timesteps_changed(self):
+        """Test that changing operating timesteps does NOT invalidate the cache.
+
+        operating_timesteps_of_each_deferrable_load is parameterised via
+        param_target_energy and param_required_timesteps (see optimization.py
+        ~line 2980-3007). Small tick-to-tick shifts in the operating-time
+        requirement (e.g. hot-water-hours-needed translating to 37 vs 38
+        timesteps) should NOT trigger a problem rebuild. This is a regression
+        test for the fix that added operating_timesteps to
+        optim_conf_runtime_keys.
+        """
+        mock_opt = MagicMock()
+        OptimizationCache.put(
+            mock_opt,
+            self.optim_conf,
+            self.plant_conf,
+            self.costfun,
+            self.retrieve_hass_conf,
+            self.logger,
+        )
+
+        # Modify operating timesteps for load 1
+        modified_optim_conf = copy.deepcopy(self.optim_conf)
+        modified_optim_conf["operating_timesteps_of_each_deferrable_load"] = [
+            6,
+            16,
+        ]  # was implicit/None before, now varies
+
+        result = OptimizationCache.get(
+            modified_optim_conf,
+            self.plant_conf,
+            self.costfun,
+            self.retrieve_hass_conf,
+            self.logger,
+        )
+
+        # Should still return cached object since operating timesteps are parameterized
+        self.assertEqual(result, mock_opt)
+
     def test_cache_hit_start_timestep_changed(self):
         """Test that changing start timesteps does NOT invalidate the cache.
 
@@ -3968,8 +4007,13 @@ class TestOptimizationCacheIntegration(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(opt_2.param_def_current_state[0].value, 1.0)
         self.assertEqual(opt_2.param_def_current_state[1].value, 0.0)
 
-    async def test_cache_miss_on_battery_power_limit_change(self):
-        """Test that changing battery_discharge_power_max causes cache MISS (via plant_conf_hash)."""
+    async def test_cache_hit_on_battery_power_limit_change(self):
+        """Test that changing battery_discharge_power_max keeps cache HIT.
+
+        Both battery power limits live in plant_runtime_keys and are wired
+        through to cp.Parameters whose .value is updated per solve, so a
+        change shouldn't invalidate the cached Optimization instance.
+        """
         base_rt = {
             "pv_power_forecast": [100 * (i + 1) for i in range(10)],
             "load_power_forecast": [200] * 10,
@@ -3983,7 +4027,9 @@ class TestOptimizationCacheIntegration(unittest.IsolatedAsyncioTestCase):
         opt_1 = (await self._run_set_input(base_rt))["opt"]
         opt_2 = (await self._run_set_input({**base_rt, "battery_discharge_power_max": 9999}))["opt"]
 
-        self.assertIsNot(opt_1, opt_2, "battery_discharge_power_max change must cause cache MISS")
+        self.assertIs(opt_1, opt_2, "battery_discharge_power_max change must keep cache HIT")
+        # And the new value has been propagated to the CVXPY Parameter
+        self.assertAlmostEqual(float(opt_2.param_battery_discharge_power_max.value), 9999.0)
 
 
 if __name__ == "__main__":

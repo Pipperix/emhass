@@ -146,18 +146,40 @@ def get_forecast_dates(
     return [ts.isoformat() for ts in forecast_dates]
 
 
+def normalize_heat_cool_mode(
+    value: str,
+    *,
+    field_name: str = "mode",
+    context: str | None = None,
+) -> str:
+    """Normalize heat/cool mode values and raise on invalid input."""
+    mode_norm = str(value).strip().lower()
+    if mode_norm not in {"heat", "cool"}:
+        prefix = f"{context}: " if context else ""
+        raise ValueError(f"{prefix}invalid {field_name} '{value}'. Expected 'heat' or 'cool'.")
+    return mode_norm
+
+
 def calculate_cop_heatpump(
     supply_temperature: float | np.ndarray | pd.Series,
     carnot_efficiency: float,
     outdoor_temperature_forecast: np.ndarray | pd.Series,
+    mode: str = "heat",
 ) -> np.ndarray:
     r"""
     Calculate heat pump Coefficient of Performance (COP) for each timestep in the prediction horizon.
 
-    The COP is calculated using a Carnot-based formula:
+        The COP is calculated using a Carnot-based formula. Two modes are supported:
 
-    .. math::
-        COP(h) = \eta_{carnot} \times \frac{T_{supply\_K}}{|T_{supply\_K} - T_{outdoor\_K}(h)|}
+        - ``mode='heat'`` (default):
+
+            .. math::
+                    COP_{heat}(h) = \eta_{carnot} \times \frac{T_{supply\_K}}{T_{supply\_K} - T_{outdoor\_K}(h)}
+
+        - ``mode='cool'``:
+
+            .. math::
+                    COP_{cool}(h) = \eta_{carnot} \times \frac{T_{supply\_K}}{T_{outdoor\_K}(h) - T_{supply\_K}}
 
     Where temperatures are converted to Kelvin (K = °C + 273.15).
 
@@ -177,6 +199,10 @@ def calculate_cop_heatpump(
     :param outdoor_temperature_forecast: Array of outdoor temperature forecasts in degrees Celsius, \
         one value per timestep in the prediction horizon.
     :type outdoor_temperature_forecast: np.ndarray or pd.Series
+    :param mode: Operating mode, either ``"heat"`` or ``"cool"``. In cooling mode,
+        the Carnot lift uses ``T_outdoor - T_supply`` so warm weather no longer
+        collapses to COP=1.0 as in heating-only validation.
+    :type mode: str
     :return: Array of COP values for each timestep, same length as outdoor_temperature_forecast. \
         Typical COP range: 2-6 for normal operating conditions.
     :rtype: np.ndarray
@@ -209,14 +235,20 @@ def calculate_cop_heatpump(
     supply_temperature_kelvin = supply_temps + 273.15
     outdoor_temperature_kelvin = outdoor_temps + 273.15
 
-    # Calculate temperature difference (supply - outdoor)
-    # For heating, supply temperature should be higher than outdoor temperature
-    temperature_diff = supply_temperature_kelvin - outdoor_temperature_kelvin
+    mode_norm = normalize_heat_cool_mode(mode, field_name="mode", context="COP calculation")
 
-    # Check for non-physical scenarios where outdoor temp >= supply temp
-    # This indicates cooling mode or invalid configuration for heating
+    # Calculate temperature lift depending on mode.
+    if mode_norm == "heat":
+        # Heating: source is outdoor, sink is supply side.
+        temperature_diff = supply_temperature_kelvin - outdoor_temperature_kelvin
+        invalid_relation = "outdoor temperature >= supply temperature"
+    else:
+        # Cooling: source is indoor/chilled supply side, sink is outdoor.
+        temperature_diff = outdoor_temperature_kelvin - supply_temperature_kelvin
+        invalid_relation = "outdoor temperature <= supply temperature"
+
+    # Check for non-physical scenarios where Carnot lift is non-positive.
     if np.any(temperature_diff <= 0):
-        # Log warning about non-physical temperature scenario
         logger = logging.getLogger(__name__)
         num_invalid = int(np.sum(temperature_diff <= 0))
         invalid_indices = np.nonzero(temperature_diff <= 0)[0]
@@ -227,15 +259,14 @@ def calculate_cop_heatpump(
         else:
             supply_range = f"supply {float(supply_temps):.1f}°C"
         logger.warning(
-            f"COP calculation: {num_invalid} timestep(s) have outdoor temperature >= supply temperature. "
-            f"This is non-physical for heating mode. Indices: {invalid_indices.tolist()[:5]}{'...' if len(invalid_indices) > 5 else ''}. "
-            f"{supply_range}. Setting COP to 1.0 (direct electric heating) for these periods."
+            f"COP calculation: {num_invalid} timestep(s) have {invalid_relation}. "
+            f"This is non-physical for {mode_norm} mode. "
+            f"Indices: {invalid_indices.tolist()[:5]}{'...' if len(invalid_indices) > 5 else ''}. "
+            f"{supply_range}. Setting COP to 1.0 for these periods."
         )
 
-    # Vectorized Carnot-based COP calculation
-    # COP = carnot_efficiency × T_supply / (T_supply - T_outdoor)
-    # For non-physical cases (outdoor >= supply), we use a neutral COP of 1.0
-    # This prevents the optimizer from exploiting unrealistic high COP values
+    # Vectorized Carnot-based COP calculation.
+    # For non-physical cases (lift <= 0), use a neutral COP of 1.0.
 
     # Avoid division by zero: use a mask to only calculate for valid cases
     cop_values = np.ones_like(outdoor_temperature_kelvin)  # Default to 1.0 everywhere
@@ -368,9 +399,10 @@ def resolve_thermal_battery_cop(
     multiplier on input power: `Q_thermal = COP * P_in / 1000 * dt`. Two source types
     are supported:
 
-    - Heat pump (default): COP is computed via the Carnot formula and varies with
-      the outdoor temperature. Requires `supply_temperature` in `hc`; uses
-      `carnot_efficiency` (default 0.4).
+        - Heat pump (default): COP is computed via the Carnot formula and varies with
+            the outdoor temperature. Requires `supply_temperature` in `hc`; uses
+            `carnot_efficiency` (default 0.4). If `sense` is set to `"cool"`, cooling
+            Carnot lift is used (`T_outdoor - T_supply`).
     - Constant-efficiency source (gas boiler, oil burner, district heating, etc.):
       `efficiency` in `hc` is used as a flat conversion factor for every timestep.
       `supply_temperature` is not required and outdoor temperature is ignored. The
@@ -421,6 +453,11 @@ def resolve_thermal_battery_cop(
         supply_temperature=supply_temperature,
         carnot_efficiency=hc.get("carnot_efficiency", 0.4),
         outdoor_temperature_forecast=outdoor_temperature_forecast,
+        mode=normalize_heat_cool_mode(
+            hc.get("sense") or "heat",
+            field_name="sense",
+            context="thermal_battery",
+        ),
     )
     return cops if length is None else cops[:length]
 
@@ -1649,6 +1686,9 @@ async def treat_runtimeparams(
         # Define Helper Functions
         def _cast_bool(value):
             """Helper to cast string inputs to boolean safely."""
+            # ast.literal_eval('None') returns None without raising — explicit guard needed.
+            if value is None:
+                return False
             try:
                 return ast.literal_eval(str(value).capitalize())
             except (ValueError, SyntaxError):
@@ -1810,11 +1850,28 @@ async def treat_runtimeparams(
                     dcs = orjson.loads(dcs)
                 except Exception:
                     logger.warning(f"Could not parse def_current_state string: {dcs}")
-            # Check it's iterable before casting to bool
+            # Use _cast_bool (not bool()) so string 'False' → False, not True.
+            # bool('False') = True because non-empty strings are truthy in Python.
             if isinstance(dcs, list):
-                params["optim_conf"]["def_current_state"] = [bool(s) for s in dcs]
+                params["optim_conf"]["def_current_state"] = [_cast_bool(s) for s in dcs]
             else:
-                params["optim_conf"]["def_current_state"] = [bool(dcs)]
+                n_loads = len(params["optim_conf"]["nominal_power_of_deferrable_loads"])
+                params["optim_conf"]["def_current_state"] = [_cast_bool(dcs)] * n_loads
+
+        # set_deferrable_load_single_constant arrives via the generic associations.csv
+        # path as-is (may be a list of strings from runtimeparams JSON).  Apply the
+        # same _cast_bool coercion so 'False' → False, not True (#873, mirrors #876).
+        if "set_deferrable_load_single_constant" in runtimeparams.keys():
+            sdlsc = runtimeparams["set_deferrable_load_single_constant"]
+            if isinstance(sdlsc, list):
+                params["optim_conf"]["set_deferrable_load_single_constant"] = [
+                    _cast_bool(s) for s in sdlsc
+                ]
+            else:
+                n_loads = len(params["optim_conf"]["nominal_power_of_deferrable_loads"])
+                params["optim_conf"]["set_deferrable_load_single_constant"] = [
+                    _cast_bool(sdlsc)
+                ] * n_loads
 
         # Treat retrieve data from Home Assistant (retrieve_hass_conf) configuration parameters passed at runtime
         # Secrets passed at runtime

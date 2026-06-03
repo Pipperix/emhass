@@ -1396,6 +1396,36 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(optim_conf_out["number_of_deferrable_loads"], 1)
         self.assertEqual(len(optim_conf_out["def_load_config"]), 1)
 
+    async def test_treat_runtimeparams_bool_coercion(self):
+        """_cast_bool None-guard and scalar-padding paths must be covered.
+
+        def_current_state=None hits `if value is None` in _cast_bool and the
+        scalar else-branch (padded to n_loads).  set_deferrable_load_single_constant
+        with a scalar bool hits its scalar else-branch identically.
+        """
+        params = await TestUtils.get_test_params()
+        params_json = orjson.dumps(params).decode("utf-8")
+        retrieve_hass_conf, optim_conf, plant_conf = utils.get_yaml_parse(params_json, logger)
+        runtimeparams_json = orjson.dumps(
+            {
+                "def_current_state": None,
+                "set_deferrable_load_single_constant": False,
+            }
+        ).decode("utf-8")
+        _, _, optim_conf_out, _ = await utils.treat_runtimeparams(
+            runtimeparams_json,
+            params_json,
+            retrieve_hass_conf,
+            optim_conf,
+            plant_conf,
+            "dayahead-optim",
+            logger,
+            emhass_conf,
+        )
+        n = len(optim_conf_out["nominal_power_of_deferrable_loads"])
+        self.assertEqual(optim_conf_out["def_current_state"], [False] * n)
+        self.assertEqual(optim_conf_out["set_deferrable_load_single_constant"], [False] * n)
+
     def test_param_to_config(self):
         """Test converting built params back to a flat config dictionary and masking secrets."""
         # Create a mock parameter dictionary with the required categories
@@ -2386,6 +2416,71 @@ class TestHeatingDemand(unittest.TestCase):
         self.assertGreater(cops[0], 1.0, "Valid scenario should have COP > 1.0")
         self.assertGreater(cops[1], 1.0, "Valid scenario should have COP > 1.0")
 
+    def test_calculate_cop_heatpump_cooling_mode(self):
+        """Cooling mode uses the inverted Carnot lift (outdoor - supply)."""
+        supply_temp = 18.5
+        carnot_eff = 0.45
+        outdoor_temps = np.array([24.0, 30.0])
+
+        cops = utils.calculate_cop_heatpump(
+            supply_temp,
+            carnot_eff,
+            outdoor_temps,
+            mode="cool",
+        )
+
+        supply_kelvin = supply_temp + 273.15
+        expected = carnot_eff * supply_kelvin / ((outdoor_temps + 273.15) - supply_kelvin)
+        expected = np.clip(expected, 1.0, 8.0)
+
+        np.testing.assert_allclose(cops, expected)
+        self.assertTrue(np.all(cops > 1.0))
+
+    def test_calculate_cop_heatpump_cooling_mode_warning(self):
+        """Cooling mode warns and clamps to COP=1.0 when outdoor <= supply."""
+        supply_temp = 18.5
+        carnot_eff = 0.45
+        outdoor_temps = np.array([15.0, 18.5, 22.0])
+
+        with self.assertLogs("emhass.utils", level="WARNING") as log_context:
+            cops = utils.calculate_cop_heatpump(
+                supply_temp,
+                carnot_eff,
+                outdoor_temps,
+                mode="cool",
+            )
+
+            self.assertTrue(
+                any(
+                    "outdoor temperature <= supply temperature" in msg for msg in log_context.output
+                )
+            )
+
+        self.assertEqual(cops[0], 1.0)
+        self.assertEqual(cops[1], 1.0)
+        self.assertGreater(cops[2], 1.0)
+
+    def test_calculate_cop_heatpump_invalid_mode_raises(self):
+        """Invalid mode must fail explicitly instead of silently falling back."""
+        with self.assertRaises(ValueError) as ctx:
+            utils.calculate_cop_heatpump(
+                supply_temperature=35.0,
+                carnot_efficiency=0.4,
+                outdoor_temperature_forecast=np.array([5.0, 10.0]),
+                mode=" typo ",
+            )
+        self.assertIn("COP calculation", str(ctx.exception))
+        self.assertIn("Expected 'heat' or 'cool'", str(ctx.exception))
+
+    def test_normalize_heat_cool_mode(self):
+        self.assertEqual(utils.normalize_heat_cool_mode(" HeAt "), "heat")
+        self.assertEqual(utils.normalize_heat_cool_mode(" COOL "), "cool")
+
+        with self.assertRaises(ValueError) as ctx:
+            utils.normalize_heat_cool_mode(" typo ", field_name="sense", context="thermal_battery")
+        self.assertIn("thermal_battery", str(ctx.exception))
+        self.assertIn("invalid sense", str(ctx.exception))
+
     def test_calculate_thermal_loss_signed(self):
         """Test thermal loss sign-switching utility function based on Langer & Volling (2020)."""
         # Test basic calculation with temperatures crossing the indoor threshold
@@ -2487,6 +2582,37 @@ class TestResolveThermalBatteryCop(unittest.TestCase):
         cops_explicit = utils.resolve_thermal_battery_cop(hc_explicit, outdoor, length=3)
         cops_implicit = utils.resolve_thermal_battery_cop(hc_implicit, outdoor, length=3)
         np.testing.assert_array_almost_equal(cops_explicit, cops_implicit)
+
+    def test_heatpump_mode_cooling_sense_uses_cooling_cop(self):
+        """resolve_thermal_battery_cop should forward sense='cool' to COP calc."""
+        hc = {
+            "sense": "cool",
+            "supply_temperature": 18.5,
+            "carnot_efficiency": 0.45,
+        }
+        outdoor = np.array([24.0, 30.0])
+        cops = utils.resolve_thermal_battery_cop(hc, outdoor, length=2)
+        expected = utils.calculate_cop_heatpump(18.5, 0.45, outdoor, mode="cool")
+        np.testing.assert_array_almost_equal(cops, expected)
+
+    def test_heatpump_mode_invalid_sense_raises(self):
+        hc = {
+            "sense": "invalid",
+            "supply_temperature": 18.5,
+            "carnot_efficiency": 0.45,
+        }
+        outdoor = np.array([24.0, 30.0])
+        with self.assertRaises(ValueError) as ctx:
+            utils.resolve_thermal_battery_cop(hc, outdoor, length=2)
+        self.assertIn("thermal_battery", str(ctx.exception))
+        self.assertIn("invalid sense", str(ctx.exception))
+
+    def test_sense_null_falls_back_to_heat(self):
+        outdoor = np.array([0.0, 5.0])
+        expected = utils.calculate_cop_heatpump(35.0, 0.4, outdoor, mode="heat")
+        hc = {"sense": None, "supply_temperature": 35.0}
+        cops = utils.resolve_thermal_battery_cop(hc, outdoor, length=2)
+        np.testing.assert_array_almost_equal(cops, expected)
 
     def test_missing_both_efficiency_and_supply_temperature_raises(self):
         """At least one of efficiency or supply_temperature must be set."""
