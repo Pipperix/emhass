@@ -58,13 +58,13 @@ def generate_mpc_plot(results_csv_path: str, output_html_path: str):
     y2_min = y2_max * (y1_min / y1_max)
 
     fig.update_layout(
-        title={'text': "<b>EMHASS Standalone MPC Benchmark: Multi-Appliance Simulation</b>", 'x':0.5, 'xanchor': 'center'},
+        title={'text': "<b>EMHASS Standalone MPC Benchmark: Multi-Appliance Simulation</b>", 'x':0.5, 'xanchor': 'center', 'y': 0.98},
         xaxis_title="Time",
         template="plotly_white",
         legend=dict(orientation="h", yanchor="bottom", y=1.05, xanchor="center", x=0.5, bgcolor='rgba(255, 255, 255, 0.7)'),
         hovermode="x unified",
         barmode='overlay',
-        margin=dict(t=120, b=80, l=60, r=60),
+        margin=dict(t=160, b=80, l=60, r=60),
         height=700
     )
 
@@ -104,7 +104,7 @@ def generate_dayahead_plot(results_csv_path: str, output_html_path: str, config:
 
     df.rename(columns=rename_map, inplace=True)
     
-    # Filtriamo il DataFrame per mantenere solo le colonne mappate (rimuovendo le variabili diagnostiche del solutore)
+    # Filter the DataFrame to keep only the mapped columns (removing solver diagnostic variables)
     cols_to_keep = [c for c in rename_map.values() if c in df.columns]
     df = df[cols_to_keep]
     
@@ -138,10 +138,10 @@ def generate_mpc_plot_from_df(df, output_html_path, title):
     y2_max = 105.0
     y2_min = y2_max * (y1_min / y1_max)
 
-    fig.update_layout(title={'text': f"<b>{title}</b>", 'x':0.5, 'xanchor': 'center'}, 
+    fig.update_layout(title={'text': f"<b>{title}</b>", 'x':0.5, 'xanchor': 'center', 'y': 0.98}, 
                       template="plotly_white", barmode='overlay', hovermode="x unified",
-                      legend=dict(orientation="h", yanchor="bottom", y=1.05, xanchor="center", x=0.5, bgcolor='rgba(255, 255, 255, 0.7)'),
-                      margin=dict(t=120, b=80, l=60, r=60),
+                      legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5, bgcolor='rgba(255, 255, 255, 0.7)'),
+                      margin=dict(t=160, b=80, l=60, r=60),
                       height=700)
     fig.update_yaxes(title_text="Power (Watts)", range=[y1_min, y1_max], secondary_y=False)
     fig.update_yaxes(title_text="State of Charge (%)", range=[y2_min, y2_max], secondary_y=True)

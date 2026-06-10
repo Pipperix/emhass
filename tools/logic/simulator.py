@@ -228,6 +228,14 @@ class EmhassSimulator:
             for i, load in enumerate(self.config["deferrable_loads"]):
                 col_name = f"P_deferrable{i}"
                 power = current_res[col_name]
+                
+                # TODO: Implement workaround for purely opportunistic static loads
+                if load.get("force_quantization", False):
+                    if power >= (load["nominal_power"] * 0.95):
+                        power = load["nominal_power"]
+                    else:
+                        power = 0.0
+                        
                 def_powers[load["name"]] = power
                 total_def_power += power
 
