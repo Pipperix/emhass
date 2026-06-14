@@ -91,8 +91,8 @@ def generate_dayahead_plot(results_csv_path: str, output_html_path: str, config:
 
     # Map EMHASS-native standard columns
     rename_map = {
-        'P_PV': 'pv_actual',
-        'P_Load': 'load_actual',
+        'P_PV': 'pv_forecast',
+        'P_Load': 'load_forecast',
         'P_grid': 'grid_power',
         'P_batt': 'batt_power',
         'SOC_opt': 'batt_soc',
@@ -108,17 +108,29 @@ def generate_dayahead_plot(results_csv_path: str, output_html_path: str, config:
     cols_to_keep = [c for c in rename_map.values() if c in df.columns]
     df = df[cols_to_keep]
     
+    # FORWARD COMPATIBILITY: Force plot to only show the first 24h (Day 1)
+    time_step_min = config.get("time_step_min", 30)
+    steps_per_day = int(24 * 60 / time_step_min)
+    if len(df) > steps_per_day:
+        df = df.iloc[:steps_per_day]
+    
     # Re-use the same logic as MPC for plotting
-    generate_mpc_plot_from_df(df, output_html_path, "EMHASS Day-Ahead Multi-Appliance Optimization")
+    generate_mpc_plot_from_df(df, output_html_path, "EMHASS Day-Ahead Multi-Appliance Optimization (Day 1)")
 
 def generate_mpc_plot_from_df(df, output_html_path, title):
     """Helper to generate plot from a prepared DataFrame."""
-    standard_cols = ['pv_actual', 'load_actual', 'grid_power', 'batt_power', 'batt_soc']
+    pv_col = 'pv_actual' if 'pv_actual' in df.columns else 'pv_forecast'
+    load_col = 'load_actual' if 'load_actual' in df.columns else 'load_forecast'
+    
+    pv_name = "PV Actual (W)" if pv_col == 'pv_actual' else "PV Forecast (W)"
+    load_name = "House Load Actual (W)" if load_col == 'load_actual' else "House Load Forecast (W)"
+
+    standard_cols = ['pv_actual', 'pv_forecast', 'load_actual', 'load_forecast', 'grid_power', 'batt_power', 'batt_soc']
     def_load_cols = [c for c in df.columns if c not in standard_cols and not c.startswith('cost_')]
 
     fig = make_subplots(specs=[[{"secondary_y": True}]])
-    fig.add_trace(go.Scatter(x=df.index, y=df['pv_actual'], name="PV Actual (W)", line=dict(color='#ff9f43', width=2.5), fill='tozeroy', fillcolor='rgba(255, 159, 67, 0.1)'), secondary_y=False)
-    fig.add_trace(go.Scatter(x=df.index, y=df['load_actual'], name="House Load Actual (W)", line=dict(color='#2e86de', width=2, dash='dash')), secondary_y=False)
+    fig.add_trace(go.Scatter(x=df.index, y=df[pv_col], name=pv_name, line=dict(color='#ff9f43', width=2.5), fill='tozeroy', fillcolor='rgba(255, 159, 67, 0.1)'), secondary_y=False)
+    fig.add_trace(go.Scatter(x=df.index, y=df[load_col], name=load_name, line=dict(color='#2e86de', width=2, dash='dash')), secondary_y=False)
     
     colors = ['#1dd1a1', '#2e86de', '#ff9f43', '#9b59b6', '#ee5253', '#0abde3', '#10ac84', '#5f27cd']
     for i, col in enumerate(def_load_cols):

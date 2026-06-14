@@ -26,6 +26,7 @@ import os
 import pathlib
 import sys
 import argparse
+import pandas as pd
 
 # Configure HIGHS solver for CVXPY
 os.environ["LP_SOLVER"] = "HIGHS"
@@ -37,17 +38,10 @@ if str(current_dir) not in sys.path:
 from logic import load_and_prepare_dataset, EmhassSimulator, generate_mpc_plot, generate_dayahead_plot
 
 
-def main():
-    parser = argparse.ArgumentParser(description="EMHASS Simulation Runner")
-    parser.add_argument("--config", type=str, default="dynamic_miner_config.json", help="Name of the config file (inside configs/)")
-    parser.add_argument("--dataset", type=str, default="scenario_2026_05_09.csv", help="Name of the dataset file (inside datasets/)")
-    args = parser.parse_args()
-
-    base_dir = current_dir
-
+def run_single_scenario(config_name_raw, dataset_name_raw, base_dir):
     # Ensure extensions are present
-    config_name = args.config if args.config.endswith(".json") else f"{args.config}.json"
-    dataset_name = args.dataset if args.dataset.endswith(".csv") else f"{args.dataset}.csv"
+    config_name = config_name_raw if config_name_raw.endswith(".json") else f"{config_name_raw}.json"
+    dataset_name = dataset_name_raw if dataset_name_raw.endswith(".csv") else f"{dataset_name_raw}.csv"
 
     config_path = base_dir / "configs" / config_name
     dataset_path = base_dir / "datasets" / dataset_name
@@ -81,12 +75,34 @@ def main():
     simulator = EmhassSimulator(config)
 
     # === 4. Day-Ahead Optimization ===
-    print("4. Running Day-Ahead Optimization...")
+    print("4. Running Day-Ahead Optimization (split by day)...")
     try:
-        df_dayahead = simulator.simulate_day_ahead(df_data)
+        time_step_min = config["time_step_min"]
+        steps_per_day = int(24 * 60 / time_step_min)
+        
+        # Day 1
+        df_data_day1 = df_data.iloc[:steps_per_day]
+        df_dayahead_day1 = simulator.simulate_day_ahead(df_data_day1)
+        
+        # Day 2
+        original_initial_soc = simulator.config["initial_soc"]
+        # Update SOC for Day 2 based on the end of Day 1
+        simulator.config["initial_soc"] = df_dayahead_day1["SOC_opt"].iloc[-1]
+        
+        df_data_day2 = df_data.iloc[steps_per_day : 2 * steps_per_day]
+        df_dayahead_day2 = simulator.simulate_day_ahead(df_data_day2)
+        
+        # Restore original SOC just in case it's used elsewhere
+        simulator.config["initial_soc"] = original_initial_soc
+        
+        # Concatenate and save the full 48h Day-Ahead result
+        df_dayahead = pd.concat([df_dayahead_day1, df_dayahead_day2])
         df_dayahead.to_csv(out_csv_dayahead)
+        
+        # Plot the Day-Ahead results (visualizer internally limits to 24h)
         generate_dayahead_plot(str(out_csv_dayahead), str(out_html_dayahead), config)
-        print(f"   Day-Ahead completed.")
+        
+        print(f"   Day-Ahead completed. (Plotted Day 1 only)")
     except Exception as e:
         print(f"   Error in Day-Ahead: {e}")
 
@@ -147,8 +163,42 @@ def main():
     except Exception as e:
         print(f"   Error in MPC execution: {e}")
 
-    print("\n[OK] Simulation pipeline completed.")
+    print(f"\n[OK] Scenario {combo_name} completed.")
 
+def main():
+    parser = argparse.ArgumentParser(description="EMHASS Simulation Runner")
+    parser.add_argument("--config", type=str, default="dynamic_miner_config.json", help="Name of the config file (inside configs/)")
+    parser.add_argument("--dataset", type=str, default="scenario_2026_05_09.csv", help="Name of the dataset file (inside datasets/)")
+    parser.add_argument("--run-all", action="store_true", help="Run all combinations of configs and datasets in batch mode")
+    args = parser.parse_args()
+
+    base_dir = current_dir
+
+    if args.run_all:
+        configs_dir = base_dir / "configs"
+        datasets_dir = base_dir / "datasets"
+        
+        # Scan for all configuration and dataset files
+        configs = [f.name for f in configs_dir.glob("*.json")]
+        datasets = [f.name for f in datasets_dir.glob("*.csv")]
+        
+        print(f"--- BATCH MODE ---")
+        print(f"Found {len(configs)} configs and {len(datasets)} datasets.")
+        
+        # Nested loop for Cartesian product of scenarios
+        for cfg in configs:
+            for ds in datasets:
+                print(f"\n{'='*80}")
+                print(f"Executing Batch Scenario: Config='{cfg}', Dataset='{ds}'")
+                print(f"{'='*80}")
+                try:
+                    run_single_scenario(cfg, ds, base_dir)
+                except Exception as e:
+                    # Robust error handling for batch processing
+                    print(f"[ERROR] Batch scenario {cfg} + {ds} failed: {e}", file=sys.stderr)
+    else:
+        # Single scenario execution
+        run_single_scenario(args.config, args.dataset, base_dir)
 
 if __name__ == "__main__":
     main()

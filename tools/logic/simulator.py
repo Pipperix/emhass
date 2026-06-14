@@ -229,11 +229,16 @@ class EmhassSimulator:
                 col_name = f"P_deferrable{i}"
                 power = current_res[col_name]
                 
-                # TODO: Implement workaround for purely opportunistic static loads
+                # FIXME: Simulator-level Workarounds for Opportunistic Loads
                 if load.get("force_quantization", False):
+                    # Static Load Workaround: Snap to nominal power or 0
                     if power >= (load["nominal_power"] * 0.95):
                         power = load["nominal_power"]
                     else:
+                        power = 0.0
+                elif "physical_min_power" in load:
+                    # Dynamic Load Workaround: Cut off if below physical threshold
+                    if power < load["physical_min_power"]:
                         power = 0.0
                         
                 def_powers[load["name"]] = power
