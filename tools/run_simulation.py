@@ -35,7 +35,7 @@ current_dir = pathlib.Path(__file__).parent.resolve()
 if str(current_dir) not in sys.path:
     sys.path.append(str(current_dir))
 
-from logic import load_and_prepare_dataset, EmhassSimulator, generate_mpc_plot, generate_dayahead_plot
+from logic import load_and_prepare_dataset, EmhassSimulator, generate_mpc_plot, generate_dayahead_plot, generate_comparison_plot
 
 
 def run_single_scenario(config_name_raw, dataset_name_raw, base_dir):
@@ -57,6 +57,7 @@ def run_single_scenario(config_name_raw, dataset_name_raw, base_dir):
     out_csv_mpc = out_dir / "optimization_result.csv"
     out_html_mpc = out_dir / "optimization_result.html"
     out_html_dayahead = out_dir / "dayahead_result.html"
+    out_html_comparison = out_dir / "comparison_result.html"
     out_summary = out_dir / "summary.txt"
 
     # === 1. Load configuration ===
@@ -100,7 +101,7 @@ def run_single_scenario(config_name_raw, dataset_name_raw, base_dir):
         df_dayahead.to_csv(out_csv_dayahead)
         
         # Plot the Day-Ahead results (visualizer internally limits to 24h)
-        generate_dayahead_plot(str(out_csv_dayahead), str(out_html_dayahead), config)
+        generate_dayahead_plot(str(out_csv_dayahead), str(out_html_dayahead), config, config_base, dataset_base)
         
         print(f"   Day-Ahead completed. (Plotted Day 1 only)")
     except Exception as e:
@@ -116,8 +117,9 @@ def run_single_scenario(config_name_raw, dataset_name_raw, base_dir):
         df_mpc.to_csv(out_csv_mpc)
 
         # === 6. Visualization ===
-        print("6. Generating final Plotly chart...")
-        generate_mpc_plot(str(out_csv_mpc), str(out_html_mpc))
+        print("6. Generating final Plotly charts...")
+        generate_mpc_plot(str(out_csv_mpc), str(out_html_mpc), config_base, dataset_base)
+        generate_comparison_plot(str(out_csv_mpc), str(out_csv_dayahead), str(out_html_comparison), config, config_base, dataset_base)
 
         # === 7. Summary ===
         time_step_min = config["time_step_min"]
@@ -140,19 +142,44 @@ def run_single_scenario(config_name_raw, dataset_name_raw, base_dir):
 
         # Key indicators
         self_sufficiency = 1 - (total_grid_import_kwh / total_consumption_kwh) if total_consumption_kwh > 0 else 1.0
+        self_consumption = 1 - (total_grid_export_kwh / total_pv_production_kwh) if total_pv_production_kwh > 0 else 1.0
+        
+        self_sufficiency = max(0.0, min(1.0, self_sufficiency))
+        self_consumption = max(0.0, min(1.0, self_consumption))
 
+        # Economic metrics
+        total_purchase_cost = (df_mpc["grid_power"].clip(lower=0) * 0.001 * (time_step_min / 60) * df_mpc["unit_load_cost"]).sum()
+        total_sale_revenue = (df_mpc["grid_power"].clip(upper=0).abs() * 0.001 * (time_step_min / 60) * df_mpc["unit_prod_price"]).sum()
+        net_cost = total_purchase_cost - total_sale_revenue
+        
         summary_lines = [
-            "--- Simulation Summary ---",
-            f"Total PV Production:     {total_pv_production_kwh:.2f} kWh",
-            f"Total Grid Import:       {total_grid_import_kwh:.2f} kWh",
-            f"Total Grid Export:       {total_grid_export_kwh:.2f} kWh",
-            f"Total Consumption:       {total_consumption_kwh:.2f} kWh",
-            f"  - House Load:          {total_house_load_kwh:.2f} kWh"
+            "",
+            "=" * 60,
+            "                SIMULATION DAILY SUMMARY",
+            "=" * 60,
+            f" Total PV Production:           {total_pv_production_kwh:.2f} kWh",
+            f" Total Grid Import:              {total_grid_import_kwh:.2f} kWh",
+            f" Total Grid Export:              {total_grid_export_kwh:.2f} kWh",
+            f" Total Consumption:             {total_consumption_kwh:.2f} kWh",
+            "-" * 60,
+            f" Base House Load:                {total_house_load_kwh:.2f} kWh",
+            " Appliance Breakdown:"
         ]
         for name, energy in appliance_energy_dict.items():
-            summary_lines.append(f"  - Appliance ({name}): {energy:.2f} kWh")
-        summary_lines.append(f"Self-Sufficiency:        {self_sufficiency:.2%}")
-        summary_lines.append(f"Final Battery SOC:       {df_mpc['batt_soc'].iloc[-1]:.1%}")
+            summary_lines.append(f"   - {name:<25} {energy:.2f} kWh")
+        
+        summary_lines.extend([
+            "-" * 60,
+            f" Final Battery SoC:              {df_mpc['batt_soc'].iloc[-1]*100:.1f} %",
+            f" Self-Sufficiency (SSI):         {self_sufficiency*100:.1f} %",
+            f" Self-Consumption (SCI):         {self_consumption*100:.1f} %",
+            "-" * 60,
+            f" Total Import Cost:          €   {total_purchase_cost:.2f}",
+            f" Total Export Revenue:       €   {total_sale_revenue:.2f}",
+            f" Net Cost (Cost - Rev):      €   {net_cost:.2f}",
+            "=" * 60,
+            ""
+        ])
 
         summary_text = "\n".join(summary_lines)
         print(f"\n{summary_text}")
