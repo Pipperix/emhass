@@ -36,7 +36,8 @@
             "operating_hours": 2.0,
             "virtual_cost": 0.0,
             "treat_as_semi_cont": true,
-            "set_single_constant": true
+            "set_single_constant": true,
+            "end_hour_today": 24
         }
     ]
 }

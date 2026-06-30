@@ -75,6 +75,9 @@ class EmhassSimulator:
         config["treat_deferrable_load_as_semi_cont"] = [d["treat_as_semi_cont"] for d in def_loads]
         config["set_deferrable_load_single_constant"] = [d["set_single_constant"] for d in def_loads]
         config["operating_hours_of_each_deferrable_load"] = [d["operating_hours"] for d in def_loads]
+        config["deferrable_load_max_cost"] = [d.get("max_cost", 0.0) for d in def_loads]
+        config["start_timesteps_of_each_deferrable_load"] = [0] * num_def
+        config["end_timesteps_of_each_deferrable_load"] = [0] * num_def
 
         # 3. Override System parameters (Fail-fast: no .get() with defaults)
         config["set_use_battery"] = self.config["set_use_battery"]
@@ -175,9 +178,36 @@ class EmhassSimulator:
         max_p_disch_inverter = self.config["battery_discharge_power_max"]
         max_p_ch_inverter = self.config["battery_charge_power_max"]
 
+        # --- Tracking for continuous execution and daily quotas ---
+        num_loads = len(self.config["deferrable_loads"])
+        daily_accumulated_steps = {i: 0 for i in range(num_loads)}
+        active_forced_steps = {i: 0 for i in range(num_loads)}
+
+        # Get the asyncio loop to safely reconstruct the optimizer and clear memory leaks
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
         for t in range(sim_length):
             now = df_data.index[t]
+            
+            # Debugger per tenere traccia del progresso dell'ottimizzazione MPC
+            print(f"[MPC Debugger] Esecuzione step {t+1}/{sim_length} - Timestamp: {now}", flush=True)
+
+            # Reset daily counters at midnight
+            if now.hour == 0 and now.minute == 0:
+                # Tratteniamo i forced steps in corso per non interrompere un ciclo a cavallo della mezzanotte
+                daily_accumulated_steps = {i: 0 for i in range(num_loads)}
+
             window = df_data.iloc[t : t + window_size]
+
+            # ---------------------------------------------------------
+            # WORKAROUND MEMORY LEAK: Distruggere e ricreare l'ottimizzatore a ogni step
+            # Questo assicura che CVXPY e la libreria C (HIGHS/GLPK) rilascino la memoria
+            # ---------------------------------------------------------
+            self.opt = loop.run_until_complete(self._init_optimization())
 
             df_input_data = pd.DataFrame(
                 {
@@ -195,13 +225,47 @@ class EmhassSimulator:
                 for d in self.config["deferrable_loads"]
             ]
 
-            try:
-                p_pv_mpc = df_input_data["p_pv_forecast"].copy()
-                p_pv_mpc.iloc[0] = window["pv_actual"].iloc[0]
-                
-                p_load_mpc = df_input_data["P_load_forecast"].copy()
-                p_load_mpc.iloc[0] = window["load_actual"].iloc[0]
+            p_pv_mpc = df_input_data["p_pv_forecast"].copy()
+            p_pv_mpc.iloc[0] = window["pv_actual"].iloc[0]
+            
+            p_load_mpc = df_input_data["P_load_forecast"].copy()
+            p_load_mpc.iloc[0] = window["load_actual"].iloc[0]
 
+            # --- Gestione Carichi Continui (set_single_constant) e Quota Giornaliera ---
+            dynamic_def_total_hours = []
+            dynamic_def_end_timesteps = []
+            
+            for i, load in enumerate(self.config["deferrable_loads"]):
+                req_hours = load["operating_hours"]
+                req_steps = int(req_hours * 60 / time_step)
+                nom_power = load["nominal_power"]
+                
+                # Calcola il limite temporale per la giornata odierna
+                end_hour = load.get("end_hour_today", 0)
+                if end_hour > 0:
+                    minutes_to_end = (end_hour - now.hour) * 60 - now.minute
+                    steps_to_end = max(0, minutes_to_end // time_step)
+                    # Assicurati che non sfori l'orizzonte di previsione
+                    steps_to_end = min(steps_to_end, len(window))
+                    dynamic_def_end_timesteps.append(steps_to_end)
+                else:
+                    dynamic_def_end_timesteps.append(0)
+                
+                if active_forced_steps[i] > 0:
+                    # Il carico è forzato ad essere acceso in questo momento.
+                    # 1. Aggiungiamo la sua potenza al base load per la durata rimanente nella finestra
+                    forced_left = min(active_forced_steps[i], len(window))
+                    for k in range(forced_left):
+                        p_load_mpc.iloc[k] += nom_power
+                    # 2. Diciamo all'ottimizzatore di non schedulare ore per questo carico 
+                    # (poiché ci stiamo già pensando noi forzandolo)
+                    dynamic_def_total_hours.append(0.0)
+                else:
+                    # Il carico non è in esecuzione forzata. Quante ore gli restano da fare oggi?
+                    steps_left_today = max(0, req_steps - daily_accumulated_steps[i])
+                    dynamic_def_total_hours.append(steps_left_today * time_step / 60.0)
+
+            try:
                 opt_res = self.opt.perform_naive_mpc_optim(
                     df_input_data,
                     p_pv=p_pv_mpc,
@@ -209,7 +273,8 @@ class EmhassSimulator:
                     prediction_horizon=len(window),
                     soc_init=current_soc,
                     soc_final=soc_final,
-                    def_total_hours=[d["operating_hours"] for d in self.config["deferrable_loads"]],
+                    def_total_hours=dynamic_def_total_hours,
+                    def_end_timestep=dynamic_def_end_timesteps,
                 )
             except Exception as e:
                 self.logger.error(f"Optimization failed at {now}: {e}")
@@ -228,19 +293,32 @@ class EmhassSimulator:
             for i, load in enumerate(self.config["deferrable_loads"]):
                 col_name = f"P_deferrable{i}"
                 power = current_res[col_name]
+                nom_power = load["nominal_power"]
                 
-                # FIXME: Simulator-level Workarounds for Opportunistic Loads
-                if load.get("force_quantization", False):
-                    # Static Load Workaround: Snap to nominal power or 0
-                    if power >= (load["nominal_power"] * 0.95):
-                        power = load["nominal_power"]
-                    else:
-                        power = 0.0
-                elif "physical_min_power" in load:
-                    # Dynamic Load Workaround: Cut off if below physical threshold
-                    if power < load["physical_min_power"]:
-                        power = 0.0
-                        
+                # Overrides e Tracking per la Continuità
+                if active_forced_steps[i] > 0:
+                    power = nom_power
+                    active_forced_steps[i] -= 1
+                    daily_accumulated_steps[i] += 1
+                else:
+                    # FIXME: Simulator-level Workarounds for Opportunistic Loads
+                    if load.get("force_quantization", False):
+                        if power >= (nom_power * 0.95):
+                            power = nom_power
+                        else:
+                            power = 0.0
+                    elif "physical_min_power" in load:
+                        if power < load["physical_min_power"]:
+                            power = 0.0
+                            
+                    # Se il carico si sta effettivamente accendendo ora
+                    if power > 0:
+                        daily_accumulated_steps[i] += 1
+                        # Se deve andare in blocco continuo, settiamo le ore rimanenti
+                        if load.get("set_single_constant", False):
+                            req_steps = int(load["operating_hours"] * 60 / time_step)
+                            active_forced_steps[i] = max(0, req_steps - 1)
+
                 def_powers[load["name"]] = power
                 total_def_power += power
 
@@ -265,8 +343,10 @@ class EmhassSimulator:
             actual_grid = opt_grid + (real_p_batt - clipped_p_batt)
 
             # thermodynamic SOC update
-            if clipped_p_batt > 0:  energy_change_wh = clipped_p_batt * dt_hours / eff_disch
-            else: energy_change_wh = clipped_p_batt * dt_hours * eff_ch
+            if clipped_p_batt > 0:  
+                energy_change_wh = clipped_p_batt * dt_hours / eff_disch
+            else: 
+                energy_change_wh = clipped_p_batt * dt_hours * eff_ch
 
             new_soc = current_soc - (energy_change_wh / battery_capacity_wh)
             new_soc = max(soc_min, min(soc_max, new_soc))
@@ -279,6 +359,8 @@ class EmhassSimulator:
                 "grid_power": actual_grid,
                 "batt_power": clipped_p_batt,
                 "batt_soc": new_soc,
+                "unit_load_cost": window["load_cost"].iloc[0],
+                "unit_prod_price": window["prod_price"].iloc[0],
             }
             step_result.update(def_powers) # Include each individual load power
             mpc_results.append(step_result)
